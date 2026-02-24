@@ -4,3 +4,4 @@ python-dotenv
 requests
 Pillow
 yt-dlp
+gallery-dl
