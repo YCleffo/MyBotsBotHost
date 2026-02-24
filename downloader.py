@@ -11,7 +11,6 @@ import tempfile
 import time
 from cryptography.fernet import Fernet
 from cryptography.fernet import InvalidToken
-from http.cookiejar import MozillaCookieJar
 from contextlib import suppress
 from functools import partial
 from logging.handlers import RotatingFileHandler
@@ -20,11 +19,8 @@ from typing import Any, Awaitable, Callable, List, Sequence, Tuple
 from urllib import request
 from urllib.parse import parse_qs, urlparse
 
-import requests
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import MessageEntityType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
@@ -33,7 +29,6 @@ from aiogram.utils.chat_action import ChatActionSender
 from dotenv import load_dotenv
 from PIL import Image
 from yt_dlp import YoutubeDL
-import yamu
 
 load_dotenv()
 router = Router()
@@ -42,19 +37,11 @@ SUPPORTED_DOMAINS = {
     "instagram": ("instagram.com", "instagr.am"),
     "tiktok": ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"),
     "youtube": ("youtube.com", "youtu.be"),
-    "yandex_music": (
-        "music.yandex.ru",
-        "music.yandex.com",
-        "music.yandex.kz",
-        "music.yandex.by",
-        "music.yandex.ua",
-    ),
 }
 SOURCE_LABELS = {
     "instagram": "Instagram",
     "tiktok": "TikTok",
     "youtube": "YouTube",
-    "yandex_music": "Yandex Music",
 }
 
 TELEGRAM_CAPTION_LIMIT = 1024
@@ -65,8 +52,6 @@ REQUEST_TIMEOUT_SEC = 2 * 60 * 60
 STATUS_UPDATE_INTERVAL_SEC = 2
 NETWORK_RETRY_ATTEMPTS = 3
 NETWORK_RETRY_BACKOFF_SEC = 3
-YANDEX_ALBUM_RETRY_ATTEMPTS = 5
-YANDEX_ALBUM_RETRY_BACKOFF_SEC = 4
 LOGS_DIR = Path("logs")
 LOG_ROTATING_FILE = "downloader.log"
 LOG_ROTATING_MAX_BYTES = 50 * 1024 * 1024
@@ -74,9 +59,6 @@ LOG_ROTATING_BACKUP_COUNT = 20
 
 PHOTO_EXTS = {".jpg", ".jpeg", ".png"}
 WINDOWS_INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-YANDEX_TRACK_WITH_ALBUM_RE = re.compile(r"/album/(?P<album>\d+)/track/(?P<track>\d+)")
-YANDEX_TRACK_ONLY_RE = re.compile(r"/track/(?P<track>\d+)")
-YANDEX_ALBUM_ONLY_RE = re.compile(r"^/album/(?P<album>\d+)/?$")
 FORCED_MEDIA_MODE_RE = re.compile(r"@(?P<mode>vid)", re.IGNORECASE)
 
 MEDIA_MODE_AUTO = "auto"
@@ -330,551 +312,6 @@ def detect_source(url: str) -> str | None:
         if any(domain in host for domain in domains):
             return name
     return None
-
-
-def _join_artist_names(items: Any) -> str | None:
-    if not isinstance(items, list):
-        return None
-    names: List[str] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        name = (item.get("name") or "").strip()
-        if name:
-            names.append(name)
-    if not names:
-        return None
-    return ", ".join(names)
-
-
-def _resolve_yandex_track_ref(
-    session: requests.Session,
-    host: str,
-    url: str,
-) -> tuple[str, str, str]:
-    path = urlparse(url).path or ""
-
-    match = YANDEX_TRACK_WITH_ALBUM_RE.search(path)
-    if match:
-        album_id = match.group("album")
-        track_id = match.group("track")
-        ref_url = f"https://{host}/album/{album_id}/track/{track_id}"
-        return ref_url, track_id, album_id
-
-    match = YANDEX_TRACK_ONLY_RE.search(path)
-    if not match:
-        raise RuntimeError("Yandex tag enrichment supports track links only.")
-    track_id = match.group("track")
-
-    page_url = f"https://{host}/track/{track_id}"
-    resp = session.get(page_url, timeout=20, allow_redirects=True)
-    page = resp.text or ""
-    low_page = page.lower()
-    low_url = (resp.url or "").lower()
-    if "showcaptcha" in low_page or "showcaptcha" in low_url:
-        raise RuntimeError("Yandex returned captcha page.")
-
-    match = re.search(rf"album/(\d+)/track/{track_id}", page)
-    if not match:
-        redirected_path = urlparse(resp.url).path or ""
-        match = YANDEX_TRACK_WITH_ALBUM_RE.search(redirected_path)
-        if not match:
-            raise RuntimeError("Unable to resolve album id for track.")
-    album_id = match.group("album") if "album" in match.groupdict() else match.group(1)
-    ref_url = f"https://{host}/album/{album_id}/track/{track_id}"
-    return ref_url, track_id, album_id
-
-
-def _is_yandex_track_url(url: str) -> bool:
-    path = urlparse(url).path or ""
-    return bool(
-        YANDEX_TRACK_WITH_ALBUM_RE.search(path) or YANDEX_TRACK_ONLY_RE.search(path)
-    )
-
-
-def _is_yandex_album_url(url: str) -> bool:
-    path = urlparse(url).path or ""
-    return bool(YANDEX_ALBUM_ONLY_RE.fullmatch(path))
-
-
-def _extract_skipped_tracks_from_preview_warning(text: str | None) -> int | None:
-    body = (text or "").strip()
-    if not body:
-        return 0
-
-    match = re.search(r"Skipped\s+(\d+)\s+track\(s\)", body, flags=re.IGNORECASE)
-    if match:
-        try:
-            return int(match.group(1))
-        except Exception:
-            return None
-
-    if "Only a preview was downloaded" in body:
-        return 1
-    return None
-
-
-def _download_yandex_music_with_album_retries(
-    url: str,
-    progress_callback: Callable[[str], None] | None = None,
-) -> Tuple[List[Path], Path, str | None, Path | None, str | None]:
-    if not _is_yandex_album_url(url):
-        return yamu.download_yandex_music(url, progress_callback)
-
-    best_result: tuple[List[Path], Path, str | None, Path | None, str | None] | None = (
-        None
-    )
-    best_skipped: int | None = None
-    best_files_count = -1
-    last_exc: Exception | None = None
-
-    for attempt in range(1, YANDEX_ALBUM_RETRY_ATTEMPTS + 1):
-        if progress_callback:
-            progress_callback(
-                f"[album] attempt {attempt}/{YANDEX_ALBUM_RETRY_ATTEMPTS}: downloading and recovering tracks..."
-            )
-
-        try:
-            result = yamu.download_yandex_music(url, progress_callback)
-        except Exception as exc:
-            last_exc = exc
-            logging.warning(
-                "Album download attempt %s/%s failed: %s",
-                attempt,
-                YANDEX_ALBUM_RETRY_ATTEMPTS,
-                exc,
-            )
-            if attempt < YANDEX_ALBUM_RETRY_ATTEMPTS:
-                delay = YANDEX_ALBUM_RETRY_BACKOFF_SEC * attempt
-                if progress_callback:
-                    progress_callback(
-                        f"[album] attempt failed, retrying in {delay}s..."
-                    )
-                time.sleep(delay)
-            continue
-
-        files, tmp_dir, caption_text, cover_path, preview_warning = result
-        skipped = _extract_skipped_tracks_from_preview_warning(preview_warning)
-        skipped_label = "unknown" if skipped is None else str(skipped)
-        logging.info(
-            "Album attempt %s/%s result: files=%s skipped=%s",
-            attempt,
-            YANDEX_ALBUM_RETRY_ATTEMPTS,
-            len(files),
-            skipped_label,
-        )
-
-        if skipped == 0:
-            if best_result:
-                _, old_tmp_dir, _, _, _ = best_result
-                if old_tmp_dir != tmp_dir:
-                    cleanup_tmp_dir(old_tmp_dir)
-            return result
-
-        is_better = False
-        if best_result is None:
-            is_better = True
-        elif skipped is not None and best_skipped is None:
-            is_better = True
-        elif (
-            skipped is not None and best_skipped is not None and skipped < best_skipped
-        ):
-            is_better = True
-        elif skipped == best_skipped and len(files) > best_files_count:
-            is_better = True
-
-        if is_better:
-            if best_result:
-                _, old_tmp_dir, _, _, _ = best_result
-                if old_tmp_dir != tmp_dir:
-                    cleanup_tmp_dir(old_tmp_dir)
-            best_result = result
-            best_skipped = skipped
-            best_files_count = len(files)
-        else:
-            cleanup_tmp_dir(tmp_dir)
-
-        if attempt < YANDEX_ALBUM_RETRY_ATTEMPTS:
-            delay = YANDEX_ALBUM_RETRY_BACKOFF_SEC * attempt
-            if progress_callback:
-                progress_callback(
-                    f"[album] best so far: {best_files_count} track(s), "
-                    f"retrying in {delay}s for missing tracks..."
-                )
-            time.sleep(delay)
-
-    if best_result:
-        files, tmp_dir, caption_text, cover_path, preview_warning = best_result
-        retry_note = (
-            f"Downloader retries used: {YANDEX_ALBUM_RETRY_ATTEMPTS} attempt(s). "
-            f"Best result: {len(files)} track(s)."
-        )
-        if preview_warning:
-            preview_warning = f"{preview_warning}\n\n{retry_note}"
-        else:
-            preview_warning = retry_note
-        return files, tmp_dir, caption_text, cover_path, preview_warning
-
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("Album download failed after retry attempts.")
-
-
-def _normalize_yandex_cover_url(raw: str | None) -> str | None:
-    value = (raw or "").strip()
-    if not value:
-        return None
-    value = value.replace("%%", "orig")
-    if value.startswith("//"):
-        value = "https:" + value
-    elif not value.startswith("http"):
-        value = "https://" + value
-    return value
-
-
-def _extract_yandex_lyrics(payload: dict[str, Any]) -> str | None:
-    lyric_obj = payload.get("lyric")
-    if not isinstance(lyric_obj, dict):
-        return None
-
-    for key in ("fullLyrics", "lyrics", "text", "value"):
-        value = lyric_obj.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
-    for key in ("lyrics", "lines", "chunks"):
-        value = lyric_obj.get(key)
-        if isinstance(value, list):
-            parts = [str(item).strip() for item in value if str(item).strip()]
-            if parts:
-                return "\n".join(parts)
-
-    return None
-
-
-def _download_cover_bytes(url: str, timeout_sec: int = 20) -> tuple[bytes, str] | None:
-    try:
-        resp = requests.get(
-            url,
-            timeout=timeout_sec,
-            stream=True,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        resp.raise_for_status()
-    except Exception:
-        return None
-
-    content_type = (resp.headers.get("Content-Type") or "").lower()
-    mime = "image/jpeg"
-    if "png" in content_type:
-        mime = "image/png"
-    elif "webp" in content_type:
-        mime = "image/webp"
-
-    try:
-        data = resp.content
-    finally:
-        resp.close()
-
-    if not data:
-        return None
-    return data, mime
-
-
-def _load_cover_from_path(path: Path | None) -> tuple[bytes, str] | None:
-    if not path or not path.exists():
-        return None
-    suffix = path.suffix.lower()
-    mime = "image/jpeg"
-    if suffix == ".png":
-        mime = "image/png"
-    elif suffix == ".webp":
-        mime = "image/webp"
-    try:
-        data = path.read_bytes()
-    except Exception:
-        return None
-    if not data:
-        return None
-    return data, mime
-
-
-def _build_yandex_track_tags(
-    track: dict[str, Any],
-    payload: dict[str, Any],
-    source_url: str,
-) -> dict[str, str]:
-    album = None
-    albums = track.get("albums")
-    if isinstance(albums, list):
-        for item in albums:
-            if isinstance(item, dict):
-                album = item
-                break
-
-    artist = _join_artist_names(track.get("artists")) or ""
-    album_artist = (
-        _join_artist_names(album.get("artists")) if isinstance(album, dict) else ""
-    )
-    title = (track.get("title") or "").strip()
-    album_title = (album.get("title") or "").strip() if isinstance(album, dict) else ""
-    genre = (album.get("genre") or "").strip() if isinstance(album, dict) else ""
-    year = album.get("year") if isinstance(album, dict) else None
-
-    track_no = ""
-    disc_no = ""
-    if isinstance(album, dict):
-        pos = album.get("trackPosition")
-        if isinstance(pos, dict):
-            idx = pos.get("index")
-            vol = pos.get("volume")
-            if isinstance(idx, (int, float)) and idx > 0:
-                track_no = str(int(idx))
-            if isinstance(vol, (int, float)) and vol > 0:
-                disc_no = str(int(vol))
-
-    tags: dict[str, str] = {
-        "title": title,
-        "artist": artist,
-        "album": album_title,
-        "albumartist": album_artist or artist,
-        "genre": genre,
-        "tracknumber": track_no,
-        "discnumber": disc_no,
-        "comment": f"Source: {source_url}",
-        "url": source_url,
-    }
-    if isinstance(year, (int, float)) and year > 0:
-        tags["date"] = str(int(year))
-
-    cover_url = _normalize_yandex_cover_url(track.get("coverUri"))
-    if cover_url:
-        tags["cover_url"] = cover_url
-
-    lyrics = _extract_yandex_lyrics(payload)
-    if lyrics:
-        tags["lyrics"] = lyrics
-
-    return tags
-
-
-def _fetch_yandex_track_tags(source_url: str) -> dict[str, str] | None:
-    parsed = urlparse(source_url)
-    host = (parsed.netloc or "").lower()
-    host = host[4:] if host.startswith("www.") else host
-    if not any(domain in host for domain in SUPPORTED_DOMAINS["yandex_music"]):
-        return None
-
-    session = requests.Session()
-    session.headers.update(
-        {
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-        }
-    )
-
-    cookies_file = yamu.cookies_path_for_yandex_music()
-    if cookies_file and Path(cookies_file).is_file():
-        jar = MozillaCookieJar(cookies_file)
-        jar.load(ignore_discard=True, ignore_expires=True)
-        session.cookies.update(jar)
-
-    last_exc: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            ref_url, track_id, album_id = _resolve_yandex_track_ref(
-                session, host, source_url
-            )
-            headers = {
-                "Referer": ref_url,
-                "X-Requested-With": "XMLHttpRequest",
-                "X-Retpath-Y": ref_url,
-            }
-            resp = session.get(
-                f"https://{host}/handlers/track.jsx",
-                params={"track": f"{track_id}:{album_id}"},
-                headers=headers,
-                timeout=20,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            if isinstance(payload, dict) and (
-                payload.get("type") == "captcha" or "captcha" in payload
-            ):
-                raise RuntimeError("Yandex requested captcha while reading metadata.")
-
-            track = payload.get("track") if isinstance(payload, dict) else None
-            if not isinstance(track, dict):
-                return None
-            return _build_yandex_track_tags(track, payload, source_url)
-        except Exception as exc:
-            last_exc = exc
-            if attempt >= 3:
-                break
-            time.sleep(0.8 * attempt)
-    if last_exc:
-        raise last_exc
-    return None
-
-
-def _write_mp3_id3_tags(
-    path: Path,
-    tags_map: dict[str, str],
-    cover_blob: tuple[bytes, str] | None = None,
-) -> None:
-    from mutagen.id3 import (
-        APIC,
-        COMM,
-        TALB,
-        TCON,
-        TDRC,
-        TIT2,
-        TPE1,
-        TPE2,
-        TPOS,
-        TRCK,
-        USLT,
-        WXXX,
-        ID3,
-        ID3NoHeaderError,
-    )
-
-    try:
-        tags = ID3(str(path))
-    except ID3NoHeaderError:
-        tags = ID3()
-
-    for key in list(tags.keys()):
-        if key.startswith("APIC"):
-            del tags[key]
-
-    if cover_blob:
-        cover_data, cover_mime = cover_blob
-        tags.add(
-            APIC(
-                encoding=3,
-                mime=cover_mime,
-                type=3,
-                desc="Cover",
-                data=cover_data,
-            )
-        )
-
-    def _set_text(frame_id: str, frame_cls: Any, value: str | None) -> None:
-        tags.delall(frame_id)
-        cleaned = (value or "").strip()
-        if cleaned:
-            tags.add(frame_cls(encoding=3, text=[cleaned]))
-
-    _set_text("TIT2", TIT2, tags_map.get("title"))
-    _set_text("TPE1", TPE1, tags_map.get("artist"))
-    _set_text("TALB", TALB, tags_map.get("album"))
-    _set_text("TPE2", TPE2, tags_map.get("albumartist"))
-    _set_text("TCON", TCON, tags_map.get("genre"))
-    _set_text("TDRC", TDRC, tags_map.get("date"))
-    _set_text("TRCK", TRCK, tags_map.get("tracknumber"))
-    _set_text("TPOS", TPOS, tags_map.get("discnumber"))
-
-    tags.delall("COMM")
-    comment = (tags_map.get("comment") or "").strip()
-    if comment:
-        tags.add(COMM(encoding=3, lang="eng", desc="", text=[comment]))
-
-    tags.delall("WXXX")
-    source_url = (tags_map.get("url") or "").strip()
-    if source_url:
-        tags.add(WXXX(encoding=3, desc="Source", url=source_url))
-
-    tags.delall("USLT")
-    lyrics_text = (tags_map.get("lyrics") or "").strip()
-    if lyrics_text:
-        tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics_text))
-
-    tags.save(str(path), v2_version=3)
-
-
-def _apply_yandex_audio_tags(
-    source_url: str,
-    files: Sequence[Path],
-    cover_path: Path | None = None,
-) -> int:
-    mp3_files = [
-        path for path in files if path.exists() and path.suffix.lower() == ".mp3"
-    ]
-    if not mp3_files:
-        return 0
-
-    tags_map: dict[str, str] | None = None
-    if _is_yandex_track_url(source_url):
-        try:
-            tags_map = _fetch_yandex_track_tags(source_url)
-        except Exception as exc:
-            logging.warning(
-                "Failed to fetch Yandex tags, fallback to minimal ID3 tags: %s", exc
-            )
-    elif _is_yandex_album_url(source_url):
-        logging.info("Yandex album link detected: applying fallback ID3 tags per file.")
-
-    cover_blob = _load_cover_from_path(cover_path)
-    if not cover_blob and tags_map:
-        cover_url = (tags_map.get("cover_url") or "").strip()
-        if cover_url:
-            cover_blob = _download_cover_bytes(cover_url)
-
-    updated = 0
-    for path in mp3_files:
-        try:
-            if tags_map:
-                _write_mp3_id3_tags(path, tags_map, cover_blob=cover_blob)
-                updated += 1
-            else:
-                fallback_title = re.sub(r"-\d{4,}$", "", path.stem).strip()
-                fallback_tags = {
-                    "title": fallback_title,
-                    "comment": f"Source: {source_url}",
-                    "url": source_url,
-                }
-                _write_mp3_id3_tags(path, fallback_tags, cover_blob=cover_blob)
-                updated += 1
-        except Exception:
-            logging.exception("Failed to apply ID3 tags for %s", path)
-    return updated
-
-
-def local_bot_api_url() -> str:
-    for key in ("LOCAL_BOT_API_URL", "BOT_API_LOCAL_URL", "TELEGRAM_LOCAL_API_URL"):
-        val = (os.getenv(key) or "").strip()
-        if not val:
-            continue
-
-        parsed = urlparse(val)
-        host = (parsed.hostname or "").lower()
-
-        if parsed.scheme not in {"http", "https"}:
-            raise RuntimeError(
-                f"{key} must start with http:// or https://. Current value: {val}"
-            )
-        if not host:
-            raise RuntimeError(f"{key} is invalid: {val}")
-        if host == "api.telegram.org" or host.endswith(".telegram.org"):
-            raise RuntimeError(
-                "Local mode is required. Do not use api.telegram.org; "
-                "set LOCAL_BOT_API_URL to your own telegram-bot-api server."
-            )
-
-        return val.rstrip("/")
-
-    raise RuntimeError("Set LOCAL_BOT_API_URL in .env, example: http://127.0.0.1:8081")
-
-
-def build_local_session() -> AiohttpSession:
-    base_url = local_bot_api_url()
-    api_server = TelegramAPIServer.from_base(base_url, is_local=True)
-    return AiohttpSession(api=api_server, timeout=REQUEST_TIMEOUT_SEC)
 
 
 def is_youtube_gallery_url(url: str) -> bool:
@@ -2100,7 +1537,6 @@ async def cmd_start(message: types.Message) -> None:
         "- YouTube: видео и посты\n"
         "- TikTok: видео\n"
         "- Instagram: фото и видео\n\n"
-        "- Yandex Music: треки, альбомы, плейлисты\n\n"
         "Команды:\n"
         "- @vid <ссылка> — отправить только видео\n"
         "\n"
@@ -2116,8 +1552,7 @@ async def cmd_help(message: types.Message) -> None:
         "1) Отправь ссылку на YouTube -> загружу в лучшем доступном качестве\n"
         "2) Отправь ссылку на TikTok -> загружу и отправлю файлы\n"
         "3) Отправь ссылку на Instagram -> загружу и отправлю файлы\n"
-        "4) Отправь ссылку на Yandex Music -> загружу и отправлю аудио\n"
-        "5) Отправь @vid <ссылка> -> отправлю только видео\n\n",
+        "4) Отправь @vid <ссылка> -> отправлю только видео\n\n",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -2142,7 +1577,7 @@ async def handle_link(message: types.Message) -> None:
     source = detect_source(url)
     if not source:
         await message.answer(
-            "Поддерживаются YouTube, TikTok, Instagram и Yandex Music. Команда /help"
+            "Поддерживаются YouTube, TikTok и Instagram. Команда /help"
         )
         return
 
@@ -2164,8 +1599,6 @@ async def handle_link(message: types.Message) -> None:
     await progress.start()
 
     tmp_dir: Path | None = None
-    cover_path: Path | None = None
-    preview_warning: str | None = None
     progress_closed = False
 
     try:
@@ -2175,8 +1608,6 @@ async def handle_link(message: types.Message) -> None:
             action = ChatActionSender.upload_photo
         elif source in {"youtube", "tiktok"}:
             action = ChatActionSender.upload_video
-        elif source == "yandex_music":
-            action = ChatActionSender.upload_document
         else:
             action = ChatActionSender.typing
 
@@ -2192,41 +1623,15 @@ async def handle_link(message: types.Message) -> None:
             def on_download_progress(line: str) -> None:
                 loop.call_soon_threadsafe(progress.set_detail_text, line)
 
-            if source == "yandex_music":
-
-                def yandex_download_job() -> (
-                    tuple[List[Path], Path, str | None, Path | None, str | None]
-                ):
-                    files, td, cap, cover, preview = (
-                        _download_yandex_music_with_album_retries(
-                            url,
-                            on_download_progress,
-                        )
-                    )
-                    tagged = _apply_yandex_audio_tags(url, files, cover_path=cover)
-                    if tagged:
-                        on_download_progress(
-                            f"[tags] updated ID3 tags in {tagged} file(s)"
-                        )
-                    return files, td, cap, cover, preview
-
-                (
-                    files,
-                    tmp_dir,
-                    caption_text,
-                    cover_path,
-                    preview_warning,
-                ) = await loop.run_in_executor(None, yandex_download_job)
-            else:
-                download_job = partial(
-                    download_media_auto,
-                    url,
-                    dl_source,
-                    on_download_progress,
-                )
-                files, tmp_dir, caption_text = await loop.run_in_executor(
-                    None, download_job
-                )
+            download_job = partial(
+                download_media_auto,
+                url,
+                dl_source,
+                on_download_progress,
+            )
+            files, tmp_dir, caption_text = await loop.run_in_executor(
+                None, download_job
+            )
 
         progress.set_detail_text("")
         await progress.set_phase(f"Отправляю в Telegram: {len(files)} файл(ов)")
@@ -2249,27 +1654,6 @@ async def handle_link(message: types.Message) -> None:
             url,
             caption_text,
         )
-
-        if source == "yandex_music" and cover_path and cover_path.exists():
-            await _send_with_retry(
-                "send_cover_photo",
-                lambda p=cover_path: message.bot.send_photo(
-                    chat_id,
-                    types.FSInputFile(p),
-                    request_timeout=REQUEST_TIMEOUT_SEC,
-                ),
-            )
-
-        if source == "yandex_music" and preview_warning:
-            await _send_with_retry(
-                "send_preview_warning",
-                lambda t=preview_warning: message.bot.send_message(
-                    chat_id,
-                    t,
-                    parse_mode=None,
-                    request_timeout=REQUEST_TIMEOUT_SEC,
-                ),
-            )
 
         await progress.dismiss()
         progress_closed = True
@@ -2301,7 +1685,8 @@ async def handle_non_link_message(message: types.Message) -> None:
         return
     if not (message.photo or message.video or message.animation or message.document):
         return
-    await message.answer("Я работаю по ссылкам.\n" "Пример: @vid https://...")
+    await message.answer("Я работаю по ссылкам.\nПример: @vid https://...")
+
 
 def decrypt_cookies_on_startup():
     key = os.getenv("COOKIE_KEY")
@@ -2315,7 +1700,8 @@ def decrypt_cookies_on_startup():
         logging.error("Неверный формат COOKIE_KEY!")
         return
 
-    files_to_decrypt = ["cookies_instagram.enc", "cookies_yandex_music.enc"]
+    # Убрали Яндекс.Музыку из списка расшифровки
+    files_to_decrypt = ["cookies_instagram.enc"]
 
     for enc_filename in files_to_decrypt:
         if os.path.exists(enc_filename):
@@ -2334,6 +1720,7 @@ def decrypt_cookies_on_startup():
                 logging.error(f"Не удалось расшифровать {enc_filename}. Неверный ключ!")
             except Exception as e:
                 logging.error(f"Ошибка при расшифровке {enc_filename}: {e}")
+
 
 async def main() -> None:
     rotating_log, session_log = configure_logging()
