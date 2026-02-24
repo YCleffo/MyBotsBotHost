@@ -1,0 +1,6 @@
+aiogram>=3.0.0
+cryptography
+python-dotenv
+requests
+Pillow
+yt-dlp

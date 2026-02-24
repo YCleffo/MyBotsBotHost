@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from cryptography.fernet import Fernet
+from cryptography.fernet import InvalidToken
 from http.cookiejar import MozillaCookieJar
 from contextlib import suppress
 from functools import partial
@@ -2301,6 +2303,37 @@ async def handle_non_link_message(message: types.Message) -> None:
         return
     await message.answer("Я работаю по ссылкам.\n" "Пример: @vid https://...")
 
+def decrypt_cookies_on_startup():
+    key = os.getenv("COOKIE_KEY")
+    if not key:
+        logging.warning("Переменная COOKIE_KEY не найдена. Пропуск расшифровки куки.")
+        return
+
+    try:
+        cipher = Fernet(key.encode())
+    except ValueError:
+        logging.error("Неверный формат COOKIE_KEY!")
+        return
+
+    files_to_decrypt = ["cookies_instagram.enc", "cookies_yandex_music.enc"]
+
+    for enc_filename in files_to_decrypt:
+        if os.path.exists(enc_filename):
+            try:
+                with open(enc_filename, "rb") as f:
+                    encrypted_data = f.read()
+                
+                decrypted_data = cipher.decrypt(encrypted_data)
+                txt_filename = enc_filename.replace(".enc", ".txt")
+                
+                with open(txt_filename, "wb") as f:
+                    f.write(decrypted_data)
+                    
+                logging.info(f"Куки успешно расшифрованы: {txt_filename}")
+            except InvalidToken:
+                logging.error(f"Не удалось расшифровать {enc_filename}. Неверный ключ!")
+            except Exception as e:
+                logging.error(f"Ошибка при расшифровке {enc_filename}: {e}")
 
 async def main() -> None:
     rotating_log, session_log = configure_logging()
@@ -2308,14 +2341,14 @@ async def main() -> None:
     logging.info("Rotating log file: %s", rotating_log.resolve())
     logging.info("Session log file: %s", session_log.resolve())
 
+    decrypt_cookies_on_startup()
+
     token = (os.getenv("BOT_TOKEN") or "").strip()
     if not token:
         raise RuntimeError("Set BOT_TOKEN in .env")
 
-    session = build_local_session()
     bot = Bot(
         token=token,
-        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 

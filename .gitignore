@@ -12,6 +12,7 @@ env/
 
 cookies_instagram.txt
 cookies_yandex_music.txt
+encrypt_cookies.py
 
 .vscode/
 .idea/

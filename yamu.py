@@ -1678,10 +1678,8 @@ async def main() -> None:
     if not token:
         raise RuntimeError("Set BOT_TOKEN in .env")
 
-    session = build_local_session()
     bot = Bot(
         token=token,
-        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
