@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    container_name: tg-downloader-bot
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./logs:/app/logs
+
+      - ./cookies_instagram.enc:/app/cookies_instagram.enc:ro
+
+    stop_grace_period: 20s
